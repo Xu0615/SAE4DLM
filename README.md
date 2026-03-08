@@ -5,6 +5,7 @@
 **SAE4DLM** is the **first Sparse Autoencoder (SAE) interpretability framework for Diffusion Language Models (DLMs)**. It provides a unified workflow for **training**, **evaluation**, **automatic interpretation**, **steering**, and **order-strategy analysis** on DLMs.
 
 📄 **Paper:** https://arxiv.org/pdf/2602.05859
+
  🤗 **SAE Collection:** https://huggingface.co/collections/AwesomeInterpretability/dlm-scope
 
 ------
