@@ -29,9 +29,10 @@ STAT_NAMES = [
     "All-token Average",
     "Top-M Token Average",
     "Activation Frequency",
+    "Activation Variance",
 ]
 
-STAT_SHORT = ["avg_all", "avg_topm", "freq"]
+STAT_SHORT = ["avg_all", "avg_topm", "freq", "var"]
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +352,7 @@ def main() -> None:
             for s in range(num_stats):
                 activation = tensor[tt, i, s].numpy()   # [F, T]
                 plot_heatmap(
-                    activation=activation,
+                    activation=activation.copy(),
                     layer=layer,
                     stat_idx=s,
                     out_dir=tt_dir,
@@ -360,7 +361,7 @@ def main() -> None:
                     colormap=args.colormap,
                 )
                 plot_heatmap_unsorted(
-                    activation=activation,
+                    activation=activation.copy(),
                     layer=layer,
                     stat_idx=s,
                     out_dir=tt_dir,
