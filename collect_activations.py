@@ -388,9 +388,9 @@ def compute_stats_for_batch(
     feats: torch.Tensor,
     attention_mask: torch.Tensor,
     top_m: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute the three per-sequence statistics over the token dimension.
+    Compute the four per-sequence statistics over the token dimension.
 
     Args:
         feats:           [B, S, F]  SAE feature activations
@@ -401,6 +401,7 @@ def compute_stats_for_batch(
         stat1 - mean activation across all valid tokens
         stat2 - mean activation across the top-M tokens by value
         stat3 - fraction of valid tokens where the feature is active (> 0)
+        stat4 - variance of activation across all valid tokens
     """
     if feats.ndim != 3:
         raise ValueError(f"Expected feats shape [B, S, F], got {tuple(feats.shape)}")
@@ -427,7 +428,13 @@ def compute_stats_for_batch(
     # Stat 3: activation frequency (fraction of tokens where feature > 0)
     stat3 = ((feats > 0) & mask.unsqueeze(-1)).float().sum(dim=1) / valid_counts.unsqueeze(-1)
 
-    return stat1, stat2, stat3
+    # Stat 4: variance of activation across all valid tokens
+    # Var = E[x^2] - E[x]^2, computed only over valid (non-padding) tokens
+    masked_feats_sq = (feats ** 2) * mask.unsqueeze(-1)
+    mean_sq = masked_feats_sq.sum(dim=1) / valid_counts.unsqueeze(-1)  # [B, F]
+    stat4 = (mean_sq - stat1 ** 2).clamp(min=0.0)                      # [B, F]
+
+    return stat1, stat2, stat3, stat4
 
 
 # ---------------------------------------------------------------------------
@@ -469,11 +476,13 @@ class LayerStatsAccumulator:
         self.unmasked_sum_stat1 = _zero_buf()
         self.unmasked_sum_stat2 = _zero_buf()
         self.unmasked_sum_stat3 = _zero_buf()
+        self.unmasked_sum_stat4 = _zero_buf()
 
         # Running sums for masked tokens (token_type=1): {layer: [F, T]}
         self.masked_sum_stat1 = _zero_buf()
         self.masked_sum_stat2 = _zero_buf()
         self.masked_sum_stat3 = _zero_buf()
+        self.masked_sum_stat4 = _zero_buf()
 
         # Number of sequences contributing to each timestep, per token type
         self.unmasked_seq_count = torch.zeros(num_steps, dtype=torch.long)
@@ -499,6 +508,7 @@ class LayerStatsAccumulator:
         sum_s1: Dict[int, torch.Tensor],
         sum_s2: Dict[int, torch.Tensor],
         sum_s3: Dict[int, torch.Tensor],
+        sum_s4: Dict[int, torch.Tensor],
         seq_count: torch.Tensor,
         layer: int,
         feats_region: torch.Tensor,
@@ -508,10 +518,11 @@ class LayerStatsAccumulator:
         """Helper: compute stats and add to the given running-sum buffers."""
         if token_mask.sum().item() == 0:
             return
-        s1, s2, s3 = compute_stats_for_batch(feats_region, token_mask, self.top_m)
+        s1, s2, s3, s4 = compute_stats_for_batch(feats_region, token_mask, self.top_m)
         sum_s1[layer][:, t] += s1.sum(dim=0).cpu()
         sum_s2[layer][:, t] += s2.sum(dim=0).cpu()
         sum_s3[layer][:, t] += s3.sum(dim=0).cpu()
+        sum_s4[layer][:, t] += s4.sum(dim=0).cpu()
         seq_count[t] += feats_region.shape[0]
 
     def update(self, layer: int, feats: torch.Tensor) -> None:
@@ -542,22 +553,24 @@ class LayerStatsAccumulator:
         # Accumulate statistics for each token type
         self._accumulate(
             self.unmasked_sum_stat1, self.unmasked_sum_stat2, self.unmasked_sum_stat3,
+            self.unmasked_sum_stat4,
             self.unmasked_seq_count, layer, feats_region, unmasked_mask, t,
         )
         self._accumulate(
             self.masked_sum_stat1, self.masked_sum_stat2, self.masked_sum_stat3,
+            self.masked_sum_stat4,
             self.masked_seq_count, layer, feats_region, masked_mask, t,
         )
 
     def finalize(self) -> torch.Tensor:
         """
         Divide running sums by sequence counts to get per-timestep means.
-        Returns a tensor of shape [2, L, 3, F, T].
+        Returns a tensor of shape [2, L, 4, F, T].
             [0] = unmasked token statistics
             [1] = masked token statistics
         """
         num_layers = len(self.layers)
-        out = torch.zeros(2, num_layers, 3, self.feature_dim, self.num_steps, dtype=torch.float32)
+        out = torch.zeros(2, num_layers, 4, self.feature_dim, self.num_steps, dtype=torch.float32)
 
         unmasked_counts = self.unmasked_seq_count.clamp(min=1).float()  # [T]
         masked_counts   = self.masked_seq_count.clamp(min=1).float()    # [T]
@@ -567,11 +580,13 @@ class LayerStatsAccumulator:
             out[0, i, 0] = self.unmasked_sum_stat1[layer] / unmasked_counts.unsqueeze(0)
             out[0, i, 1] = self.unmasked_sum_stat2[layer] / unmasked_counts.unsqueeze(0)
             out[0, i, 2] = self.unmasked_sum_stat3[layer] / unmasked_counts.unsqueeze(0)
+            out[0, i, 3] = self.unmasked_sum_stat4[layer] / unmasked_counts.unsqueeze(0)
 
             # Masked (token_type = 1)
             out[1, i, 0] = self.masked_sum_stat1[layer] / masked_counts.unsqueeze(0)
             out[1, i, 1] = self.masked_sum_stat2[layer] / masked_counts.unsqueeze(0)
             out[1, i, 2] = self.masked_sum_stat3[layer] / masked_counts.unsqueeze(0)
+            out[1, i, 3] = self.masked_sum_stat4[layer] / masked_counts.unsqueeze(0)
 
         return out
 
@@ -669,16 +684,17 @@ def save_outputs(
     unmasked_counts: torch.Tensor,
     masked_counts: torch.Tensor,
 ) -> None:
-    """Save the [2, L, 3, F, T] tensor plus metadata to out_dir."""
+    """Save the [2, L, 4, F, T] tensor plus metadata to out_dir."""
     os.makedirs(out_dir, exist_ok=True)
 
     # Raw tensor for fast loading
-    torch.save(tensor, os.path.join(out_dir, "layer_stats_2xLx3xFxT.pt"))
+    torch.save(tensor, os.path.join(out_dir, "layer_stats_2xLx4xFxT.pt"))
 
     stats_order = [
         "all_token_average",
         f"top_{args.top_m}_token_average",
         "activation_frequency",
+        "activation_variance",
     ]
 
     # Full bundle with config for reproducibility
